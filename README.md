@@ -32,7 +32,7 @@ Run the conversion script from the activated environment so it can find both pac
 
 ### Create a template and calibration pair
 
-The template files are machine-specific and are **not included in this repository**. The filenames `PebbleFredBase.emf` and `PebbleFredBase.dxf` are historical defaults; neither file is present in this checkout.
+This repository includes `PebbleFredBase.emf` and its matching `PebbleFredBase.dxf` calibration source. The EMF is a ULS-generated PLS6 template (machine ID 33) with an explicit millimeter calibration drawing. It is useful as a ready-to-try baseline for the setup it came from; it is not a universal template. The EMF embeds machine, material, and pen settings, so inspect those in UCP/UCPX and replace the pair with one made for your cutter/material setup if they do not match.
 
 On the workstation connected to the laser:
 
@@ -76,7 +76,7 @@ python dxf_to_emf.py \
   --output-emf "/path/to/part.emf"
 ```
 
-The program's default paths point to `PebbleFredBase.emf` and `PebbleFredBase.dxf` in the current directory. Since those files are not included here, either supply your own pair with the options above or put the files at those default paths. If you see `ModuleNotFoundError`, activate the environment and install the dependencies above.
+The program defaults to `PebbleFredBase.emf` and `PebbleFredBase.dxf` in the current directory, so the included pair works without the two template options. Supply `--template-emf` and `--calibration-dxf` when using a different matching pair. If you see `ModuleNotFoundError`, activate the environment and install the dependencies above.
 
 For drawings without `$INSUNITS`, the script assumes millimeters. Set units explicitly when needed, for example `--dxf-units in` or `--dxf-units mm`. Automatic unit detection reads the DXF `$INSUNITS` header when present.
 
