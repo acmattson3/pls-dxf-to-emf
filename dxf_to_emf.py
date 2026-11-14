@@ -182,15 +182,27 @@ def bounds_from_template_geometry(records: Sequence[EmfRecord]) -> Tuple[int, in
             points.extend((float(x), float(y)) for x, y in path_points)
             count = len(path_points)
             bulge_offset = 28 + 8 * count
-            if count == 2 and len(record.raw) >= bulge_offset + 4:
-                bulge = struct.unpack_from("<f", record.raw, bulge_offset)[0]
-                if math.isfinite(bulge) and abs(bulge) > 1e-12:
+            if count >= 2 and len(record.raw) >= bulge_offset + 4 * count:
+                bulges = struct.unpack_from("<" + "f" * count, record.raw, bulge_offset)
+                for index, bulge in enumerate(bulges[: count - 1]):
+                    if not math.isfinite(bulge) or abs(bulge) <= 1e-12:
+                        continue
+                    start_x, start_y = path_points[index]
+                    end_x, end_y = path_points[index + 1]
+                    # EMF device coordinates run down the Y axis; reflect the
+                    # points while finding the DXF-style bulge arc extrema.
+                    start = (start_x, -start_y)
+                    end = (end_x, -end_y)
                     center, start_angle, end_angle, radius = bulge_to_arc(
-                        path_points[0], path_points[1], bulge
+                        start, end, bulge
                     )
+                    sweep = end_angle - start_angle
+                    if sweep <= 0:
+                        sweep += 2 * math.pi
                     points.extend(
-                        _arc_extent_points(
-                            center.x, center.y, radius, start_angle, end_angle - start_angle
+                        (x, -y)
+                        for x, y in _arc_extent_points(
+                            center.x, center.y, radius, start_angle, sweep
                         )
                     )
         elif record.rtype == EMR_COMMENT:
@@ -510,7 +522,15 @@ def extract_dxf_polylines(
                     self.draw_path(filled_path, properties)
 
             def draw_filled_polygon(self, points, properties) -> None:
-                pts = [(float(point.x), float(point.y)) for point in points]
+                # ezdxf's drawing backend passes NumpyPoints2d here, which
+                # exposes its Vec2 values through vertices() rather than
+                # iteration. Keep compatibility with plain point sequences too.
+                point_values = (
+                    points.vertices()
+                    if callable(getattr(points, "vertices", None))
+                    else points
+                )
+                pts = [(float(point.x), float(point.y)) for point in point_values]
                 if pts and pts[0] != pts[-1]:
                     pts.append(pts[0])
                 if len(pts) >= 2:
@@ -596,9 +616,11 @@ def solve_affine(
         raise ValueError("Calibration DXF has zero span in at least one axis.")
 
     candidates = []
-    for swap in ([True, False] if force_swap is None else [force_swap]):
+    # Bounds cannot distinguish reflections. Prefer the ULS/DXF convention
+    # observed in driver EMFs: preserve X/Y and invert Y.
+    for swap in ([False, True] if force_swap is None else [force_swap]):
         for flip_x in ([False, True] if force_flip_x is None else [force_flip_x]):
-            for flip_y in ([False, True] if force_flip_y is None else [force_flip_y]):
+            for flip_y in ([True, False] if force_flip_y is None else [force_flip_y]):
                 if swap:
                     src_x_min, src_x_max = _axis_min_max(dxf_min_y, dxf_max_y, flip_x)
                     src_y_min, src_y_max = _axis_min_max(dxf_min_x, dxf_max_x, flip_y)

@@ -15,6 +15,11 @@ A simple Python setup to bypass AutoCAD and the UCP printer software to directly
 
 Calibration estimates scale and offsets from the overall DXF and template geometry bounds, then picks the axis orientation with the closest X/Y scales. This works best when the calibration drawing spans the same intended work area as the template. For unusual or asymmetric calibration drawings, check the reported orientation and use the axis flags or explicit transform overrides if needed.
 
+When several orientations fit the bounds equally well, the auto-solver prefers the standard X/Y axes and flips Y, matching the PLS6 driver's DXF-to-EMF output. Bounds include arc extrema from ULS private bulge-path records.
+
 Output EMF keeps the template's ULS settings and metadata comments, removes its standard polylines, native `CIRCLE(...)` / `ARC(...)` / `ELLIPSE(...)` geometry comments, and private type-123 bulge-path records, then inserts new `EMR_POLYLINE` vectors. It updates header sizes and bounds and is intended to load in UCP/UCPX like a job produced through the original workflow.
 
 Raster image pixels are not converted into vector paths. DXF entity colors and lineweights are also not yet mapped to separate ULS pens; generated geometry inherits the template's active pen. Multi-pen jobs need validation against an original driver output before use.
+
+## Regression checks
+Run the focused conversion checks with `python -m unittest discover -s tests -v`.
