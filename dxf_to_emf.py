@@ -27,6 +27,36 @@ EMR_HEADER = 1
 EMR_POLYLINE = 4
 EMR_EOF = 14
 EMR_COMMENT = 70
+EMR_ULS_PATH = 123
+ULS_GEOMETRY_COMMENTS = (b"CIRCLE(", b"ARC(", b"ELLIPSE(")
+
+# DXF $INSUNITS values expressed as millimeters per drawing unit.
+INSUNITS_TO_MM = {
+    1: 25.4,  # inches
+    2: 304.8,  # feet
+    3: 1_609_344.0,  # miles
+    4: 1.0,  # millimeters
+    5: 10.0,  # centimeters
+    6: 1_000.0,  # meters
+    7: 1_000_000.0,  # kilometers
+    8: 0.0000254,  # microinches
+    9: 0.0254,  # mils
+    10: 914.4,  # yards
+    11: 0.0000001,  # angstroms
+    12: 0.000001,  # nanometers
+    13: 0.001,  # microns
+    14: 100.0,  # decimeters
+    15: 10_000.0,  # decameters
+    16: 100_000.0,  # hectometers
+    17: 1_000_000_000_000.0,  # gigameters
+    18: 149_597_870_700_000.0,  # astronomical units
+    19: 9_460_730_472_580_800_000.0,  # light years
+    20: 30_856_775_814_913_700_000.0,  # parsecs
+    21: 1200.0 * 1000.0 / 3937.0,  # US survey feet
+    22: 100.0 * 1000.0 / 3937.0,  # US survey inches
+    23: 3600.0 * 1000.0 / 3937.0,  # US survey yards
+    24: 6_336_000.0 * 1000.0 / 3937.0,  # US survey miles
+}
 
 
 Point = Tuple[float, float]
@@ -66,28 +96,181 @@ def parse_emf_records(path: Path) -> List[EmfRecord]:
     pos = 0
     while pos + 8 <= len(data):
         rtype, size = struct.unpack_from("<II", data, pos)
+        if size < 8:
+            raise ValueError(f"Invalid EMF record size {size} at byte offset {pos}.")
+        if size % 4:
+            raise ValueError(f"EMF record at byte offset {pos} is not DWORD-aligned (size {size}).")
+        if pos + size > len(data):
+            raise ValueError(f"EMF record at byte offset {pos} extends past end of file.")
         raw = data[pos : pos + size]
         records.append(EmfRecord(rtype=rtype, raw=raw))
         pos += size
         if rtype == EMR_EOF:
             break
+    if pos != len(data):
+        raise ValueError("Template EMF contains trailing bytes or a truncated record header.")
     if not records or records[0].rtype != EMR_HEADER:
         raise ValueError("Template EMF is missing the EMR_HEADER record.")
     if records[-1].rtype != EMR_EOF:
         raise ValueError("Template EMF is missing the EMR_EOF record.")
+    if len(records[0].raw) < 88:
+        raise ValueError("Template EMF has a truncated EMR_HEADER record.")
+    if len(records[-1].raw) < 20:
+        raise ValueError("Template EMF has a truncated EMR_EOF record.")
+    for record in records:
+        if record.rtype == EMR_COMMENT:
+            if len(record.raw) < 12:
+                raise ValueError("Template EMF has a truncated EMR_COMMENT record.")
+            data_size = struct.unpack_from("<I", record.raw, 8)[0]
+            if data_size > len(record.raw) - 12:
+                raise ValueError("Template EMF has an EMR_COMMENT payload larger than its record.")
     return records
 
 
-def split_template(records: Sequence[EmfRecord]) -> Tuple[EmfRecord, List[bytes], List[EmfRecord], List[bytes]]:
-    poly_indices = [i for i, r in enumerate(records) if r.rtype == EMR_POLYLINE]
-    if not poly_indices:
-        raise ValueError("Template EMF has no EMR_POLYLINE records to replace.")
-    first_poly, last_poly = poly_indices[0], poly_indices[-1]
+def split_template(records: Sequence[EmfRecord]) -> Tuple[EmfRecord, List[bytes | None], List[EmfRecord]]:
+    geometry_indices = [i for i, r in enumerate(records) if is_template_geometry(r)]
+    if not geometry_indices:
+        raise ValueError("Template EMF has no recognized vector geometry to replace.")
     header = records[0]
-    before = [r.raw for r in records[1:first_poly]]
-    polys = list(records[first_poly : last_poly + 1])
-    after = [r.raw for r in records[last_poly + 1 :]]
-    return header, before, polys, after
+    geometry = [r for r in records if is_template_geometry(r)]
+    slots: List[bytes | None] = []
+    inserted = False
+    for record in records[1:]:
+        if is_template_geometry(record):
+            if not inserted:
+                slots.append(None)
+                inserted = True
+        else:
+            slots.append(record.raw)
+    return header, slots, geometry
+
+
+def comment_payload(record: EmfRecord) -> bytes:
+    if record.rtype != EMR_COMMENT or len(record.raw) < 12:
+        return b""
+    data_size = struct.unpack_from("<I", record.raw, 8)[0]
+    if data_size > len(record.raw) - 12:
+        return b""
+    return record.raw[12 : 12 + data_size]
+
+
+def uls_path_points(record: EmfRecord) -> List[IntPoint] | None:
+    """Decode ULS's private type-123 polyline record, if its layout matches."""
+    if record.rtype != EMR_ULS_PATH or len(record.raw) < 36:
+        return None
+    count = struct.unpack_from("<I", record.raw, 24)[0]
+    if count < 2 or len(record.raw) < 36 + 8 * count:
+        return None
+    coords = struct.unpack_from("<" + "ll" * count, record.raw, 28)
+    return list(zip(coords[::2], coords[1::2]))
+
+
+def is_template_geometry(record: EmfRecord) -> bool:
+    if record.rtype == EMR_POLYLINE or uls_path_points(record) is not None:
+        return True
+    payload = comment_payload(record)
+    return any(payload.startswith(prefix) for prefix in ULS_GEOMETRY_COMMENTS)
+
+
+def bounds_from_template_geometry(records: Sequence[EmfRecord]) -> Tuple[int, int, int, int]:
+    points: List[Point] = []
+    for record in records:
+        if record.rtype == EMR_POLYLINE:
+            points.extend((float(x), float(y)) for x, y in polyline_points(record))
+        elif record.rtype == EMR_ULS_PATH:
+            path_points = uls_path_points(record) or []
+            points.extend((float(x), float(y)) for x, y in path_points)
+            count = len(path_points)
+            bulge_offset = 28 + 8 * count
+            if count == 2 and len(record.raw) >= bulge_offset + 4:
+                bulge = struct.unpack_from("<f", record.raw, bulge_offset)[0]
+                if math.isfinite(bulge) and abs(bulge) > 1e-12:
+                    center, start_angle, end_angle, radius = bulge_to_arc(
+                        path_points[0], path_points[1], bulge
+                    )
+                    points.extend(
+                        _arc_extent_points(
+                            center.x, center.y, radius, start_angle, end_angle - start_angle
+                        )
+                    )
+        elif record.rtype == EMR_COMMENT:
+            payload = comment_payload(record).rstrip(b"\x00")
+            try:
+                command, params = payload.split(b"(", 1)
+                if not params.endswith(b")"):
+                    continue
+                values = [float(value) for value in params[:-1].split(b",")]
+            except (ValueError, IndexError):
+                continue
+            if command == b"CIRCLE" and len(values) == 3:
+                x, y, radius = values
+                radius = abs(radius)
+                points.extend([(x - radius, y - radius), (x + radius, y + radius)])
+            elif command == b"ARC" and len(values) == 5:
+                x, y, radius, start, end = values
+                sweep = (end - start) % (2 * math.pi)
+                points.extend(
+                    _arc_extent_points(x, y, abs(radius), start, sweep)
+                )
+            elif command == b"ELLIPSE" and len(values) == 7:
+                x, y, major, rotation, ratio, start, end = values
+                points.extend(
+                    _ellipse_extent_points(
+                        x, y, abs(major), rotation, ratio, start, end - start
+                    )
+                )
+    if not points:
+        raise ValueError("Template vector geometry has no points for calibration.")
+    xs, ys = zip(*points)
+    return math.floor(min(xs)), math.floor(min(ys)), math.ceil(max(xs)), math.ceil(max(ys))
+
+
+def _arc_extent_points(x: float, y: float, radius: float, start: float, sweep: float) -> List[Point]:
+    angles = [start, start + sweep]
+    cardinals = (0, math.pi / 2, math.pi, 3 * math.pi / 2)
+    if sweep >= 0:
+        angles.extend(q for q in cardinals if (q - start) % (2 * math.pi) <= sweep)
+    else:
+        angles.extend(q for q in cardinals if (start - q) % (2 * math.pi) <= -sweep)
+    return [(x + radius * math.cos(a), y + radius * math.sin(a)) for a in angles]
+
+
+def _ellipse_extent_points(
+    x: float,
+    y: float,
+    major: float,
+    rotation: float,
+    ratio: float,
+    start: float,
+    sweep: float,
+) -> List[Point]:
+    minor = major * abs(ratio)
+    cos_rotation = math.cos(rotation)
+    sin_rotation = math.sin(rotation)
+
+    def at(parameter: float) -> Point:
+        major_component = major * math.cos(parameter)
+        minor_component = minor * math.sin(parameter)
+        return (
+            x + major_component * cos_rotation - minor_component * sin_rotation,
+            y + major_component * sin_rotation + minor_component * cos_rotation,
+        )
+
+    angles = [start, start + sweep]
+    full_ellipse = abs(sweep) >= 2 * math.pi - 1e-12
+    if major > 0 and minor > 0:
+        x_extreme = math.atan2(-minor * sin_rotation, major * cos_rotation)
+        y_extreme = math.atan2(minor * cos_rotation, major * sin_rotation)
+        for candidate in (x_extreme, x_extreme + math.pi, y_extreme, y_extreme + math.pi):
+            if full_ellipse or _angle_in_sweep(candidate, start, sweep):
+                angles.append(candidate)
+    return [at(angle) for angle in angles]
+
+
+def _angle_in_sweep(angle: float, start: float, sweep: float) -> bool:
+    if sweep >= 0:
+        return (angle - start) % (2 * math.pi) <= sweep
+    return (start - angle) % (2 * math.pi) <= -sweep
 
 
 def rebuild_comment_jobname(record: bytes, job_name: str) -> bytes:
@@ -118,6 +301,10 @@ def polyline_points(record: EmfRecord) -> List[IntPoint]:
     if rtype != EMR_POLYLINE:
         raise ValueError("Attempted to parse non-polyline record.")
     cpt = struct.unpack_from("<I", record.raw, 24)[0]
+    if size < 28 + 8 * cpt:
+        raise ValueError("EMR_POLYLINE record is too short for its declared point count.")
+    if cpt < 2:
+        raise ValueError("EMR_POLYLINE record must contain at least two points.")
     coords = struct.unpack_from("<" + "ll" * cpt, record.raw, 28)
     pts = list(zip(coords[::2], coords[1::2]))
     return pts
@@ -202,6 +389,18 @@ def extract_dxf_polylines(
     doc = ezdxf.readfile(path)
     msp = doc.modelspace()
     result: List[List[Point]] = []
+    render_entities = []
+
+    def has_world_xy_normal(entity) -> bool:
+        normal = entity.dxf.get("extrusion")
+        if normal is None:
+            return True
+        return (
+            abs(float(normal.x)) < 1e-9
+            and abs(float(normal.y)) < 1e-9
+            and abs(float(normal.z) - 1.0) < 1e-9
+        )
+
     for e in msp:
         dxftype = e.dxftype()
         if dxftype == "LINE":
@@ -235,19 +434,21 @@ def extract_dxf_polylines(
                 pts.append(pts[0])
             result.append(pts)
         elif dxftype == "POLYLINE":
-            pts = [
-                (float(v.dxf.location.x) * unit_scale, float(v.dxf.location.y) * unit_scale)
-                for v in e.vertices()
-                if not v.is_seqend
-            ]
-            if e.is_closed and pts and pts[0] != pts[-1]:
-                pts.append(pts[0])
-            result.append(pts)
+            # Use ezdxf's path renderer here so bulges, OCS/elevation, and
+            # polygon meshes are expanded instead of treating every vertex
+            # as a straight XY segment.
+            render_entities.append(e)
         elif dxftype == "CIRCLE":
+            if not has_world_xy_normal(e):
+                render_entities.append(e)
+                continue
             center = (float(e.dxf.center.x) * unit_scale, float(e.dxf.center.y) * unit_scale)
             radius = float(e.dxf.radius) * unit_scale
             result.append(sample_circle(center, radius, circle_segments))
         elif dxftype == "ARC":
+            if not has_world_xy_normal(e):
+                render_entities.append(e)
+                continue
             center = (float(e.dxf.center.x) * unit_scale, float(e.dxf.center.y) * unit_scale)
             radius = float(e.dxf.radius) * unit_scale
             start_angle = float(e.dxf.start_angle)
@@ -260,6 +461,100 @@ def extract_dxf_polylines(
             if not pts:
                 continue
             result.append(pts)
+
+        else:
+            render_entities.append(e)
+
+    if render_entities:
+        try:
+            from ezdxf.addons.drawing import Frontend, RenderContext
+            from ezdxf.addons.drawing.backend import Backend
+            from ezdxf.addons.drawing.config import Configuration, HatchPolicy, TextPolicy
+        except ImportError as exc:
+            raise RuntimeError(
+                "Rendering additional DXF entities requires Pillow. Install it with: pip install Pillow"
+            ) from exc
+
+        class PolylineCollector(Backend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.polylines: List[List[Point]] = []
+                self.raster_entities: List[str] = []
+
+            def set_background(self, color) -> None:
+                pass
+
+            def draw_point(self, pos, properties) -> None:
+                self.polylines.append([(float(pos.x), float(pos.y)), (float(pos.x), float(pos.y))])
+
+            def draw_line(self, start, end, properties) -> None:
+                self.polylines.append(
+                    [(float(start.x), float(start.y)), (float(end.x), float(end.y))]
+                )
+
+            def draw_path(self, path, properties) -> None:
+                for sub_path in path.sub_paths():
+                    pts = [
+                        (float(vertex.x), float(vertex.y))
+                        for vertex in sub_path.flattening(distance=0.01)
+                    ]
+                    if sub_path.is_closed and pts and pts[0] != pts[-1]:
+                        pts.append(pts[0])
+                    if len(pts) >= 2:
+                        self.polylines.append(pts)
+
+            def draw_filled_paths(self, paths, properties) -> None:
+                # Laser paths are vector outlines; keep hatch boundaries and
+                # text glyph outlines without turning fills into scanlines.
+                for filled_path in paths:
+                    self.draw_path(filled_path, properties)
+
+            def draw_filled_polygon(self, points, properties) -> None:
+                pts = [(float(point.x), float(point.y)) for point in points]
+                if pts and pts[0] != pts[-1]:
+                    pts.append(pts[0])
+                if len(pts) >= 2:
+                    self.polylines.append(pts)
+
+            def draw_image(self, image_data, properties) -> None:
+                entity = self.current_entity
+                self.raster_entities.append(entity.dxftype() if entity is not None else "IMAGE")
+
+            def clear(self) -> None:
+                self.polylines.clear()
+
+        class ReportingFrontend(Frontend):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.skipped_entities: List[Tuple[str, str]] = []
+
+            def skip_entity(self, entity, msg: str) -> None:
+                self.skipped_entities.append((entity.dxftype(), msg))
+                super().skip_entity(entity, msg)
+
+        collector = PolylineCollector()
+        config = Configuration(
+            circle_approximation_count=max(8, circle_segments),
+            hatch_policy=HatchPolicy.SHOW_OUTLINE,
+            text_policy=TextPolicy.OUTLINE,
+            pdmode=0,
+            pdsize=1,
+        )
+        frontend = ReportingFrontend(RenderContext(doc), collector, config)
+        frontend.draw_entities(render_entities)
+        result.extend(
+            [
+                [(x * unit_scale, y * unit_scale) for x, y in polyline]
+                for polyline in collector.polylines
+            ]
+        )
+        skipped_types = sorted({entity_type for entity_type, _ in frontend.skipped_entities})
+        if skipped_types:
+            print("Warning: unsupported or omitted DXF entities:", ", ".join(skipped_types))
+        if collector.raster_entities:
+            raster_types = ", ".join(sorted(set(collector.raster_entities)))
+            print("Warning: raster image content is not converted to vector paths:", raster_types)
+
     if not result:
         raise ValueError(f"No supported geometry found in DXF {path}")
     return result
@@ -329,6 +624,16 @@ def apply_affine(points: Sequence[Point], sx: float, ox: float, sy: float, oy: f
     return [(int(round(x * sx + ox)), int(round(y * sy + oy))) for x, y in points]
 
 
+def unit_scale_from_header(path: Path) -> float:
+    try:
+        doc = ezdxf.readfile(path)
+        insunits = int(doc.header.get("$INSUNITS", 0) or 0)
+    except Exception:
+        return 1.0
+    # Unitless and unknown drawings retain the documented millimeter default.
+    return INSUNITS_TO_MM.get(insunits, 1.0)
+
+
 def rebuild_header(
     header: EmfRecord,
     total_records: int,
@@ -355,7 +660,7 @@ def main() -> None:
     parser.add_argument("--job-name", type=str, help="Job name to embed (defaults to output filename stem).")
     parser.add_argument(
         "--dxf-units",
-        choices=["auto", "mm", "in", "inch", "inches"],
+        choices=["auto", "mm", "in", "inch", "inches", "cm", "m", "ft", "yd", "mi", "km", "mil"],
         default="auto",
         help="Units of the input DXF geometry; auto uses $INSUNITS if present (default mm).",
     )
@@ -374,33 +679,41 @@ def main() -> None:
     parser.add_argument("--offset-y", type=float, help="Override: DXF->EMF offset in Y (skip calibration).")
     args = parser.parse_args()
 
+    for name, count in (
+        ("--circle-segments", args.circle_segments),
+        ("--arc-segments", args.arc_segments),
+        ("--spline-segments", args.spline_segments),
+    ):
+        if count < 1:
+            parser.error(f"{name} must be a positive integer")
+
     records = parse_emf_records(args.template_emf)
     job_name = args.job_name or args.output_emf.stem
-    header, before, template_polys, after = split_template(records)
-    before = [rebuild_comment_jobname(r, job_name) for r in before]
-    after = [rebuild_comment_jobname(r, job_name) for r in after]
-    template_bounds = union_bounds([polyline_points(r) for r in template_polys])
+    header, slots, template_geometry = split_template(records)
+    slots = [
+        rebuild_comment_jobname(record, job_name) if record is not None else None
+        for record in slots
+    ]
+    template_bounds = bounds_from_template_geometry(template_geometry)
 
     # Determine DXF unit scale (to mm) before calibration/transform.
-    def unit_scale_from_header(path: Path) -> float:
-        try:
-            doc = ezdxf.readfile(path)
-            insunits = doc.header.get("$INSUNITS")
-        except Exception:
-            return 1.0
-        # INSUNITS codes: 1=inches, 4=mm. Default to mm if unknown.
-        if insunits == 1:
-            return 25.4
-        if insunits == 4:
-            return 1.0
-        return 1.0
-
-    if args.dxf_units in ("in", "inch", "inches"):
-        unit_scale = 25.4
-    elif args.dxf_units == "mm":
-        unit_scale = 1.0
-    else:
+    explicit_unit_scales = {
+        "mm": 1.0,
+        "in": 25.4,
+        "inch": 25.4,
+        "inches": 25.4,
+        "cm": 10.0,
+        "m": 1_000.0,
+        "ft": 304.8,
+        "yd": 914.4,
+        "mi": 1_609_344.0,
+        "km": 1_000_000.0,
+        "mil": 0.0254,
+    }
+    if args.dxf_units == "auto":
         unit_scale = unit_scale_from_header(args.input_dxf)
+    else:
+        unit_scale = explicit_unit_scales[args.dxf_units]
 
     if any(v is not None for v in (args.scale_x, args.scale_y, args.offset_x, args.offset_y)):
         if None in (args.scale_x, args.scale_y, args.offset_x, args.offset_y):
@@ -441,7 +754,7 @@ def main() -> None:
     new_poly_records = [build_polyline_record(pl, args.zero_bounds) for pl in new_polys_int if len(pl) >= 2]
 
     geom_bounds = union_bounds(new_polys_int)
-    total_records = 1 + len(before) + len(new_poly_records) + len(after)
+    total_records = 1 + sum(record is not None for record in slots) + len(new_poly_records)
     header_placeholder = rebuild_header(
         header,
         total_records,
@@ -450,7 +763,12 @@ def main() -> None:
         keep_header_counts=args.preserve_header_counts,
         zero_bounds=args.zero_bounds,
     )
-    assembled = [header_placeholder] + before + new_poly_records + after
+    assembled = [header_placeholder]
+    for record in slots:
+        if record is None:
+            assembled.extend(new_poly_records)
+        else:
+            assembled.append(record)
     total_bytes = sum(len(b) for b in assembled)
     assembled[0] = rebuild_header(
         header,
@@ -463,6 +781,7 @@ def main() -> None:
 
     args.output_emf.write_bytes(b"".join(assembled))
     print("Wrote", args.output_emf)
+    print("Note: DXF pen colors and lineweights are not mapped; geometry uses the template's active pen settings.")
     print(
         "Transform used: scale_x={:.6f}, offset_x={:.3f}, scale_y={:.6f}, offset_y={:.3f}, swap_xy={}, flip_x={}, flip_y={}".format(
             transform.sx, transform.ox, transform.sy, transform.oy, transform.swap, transform.flip_x, transform.flip_y
